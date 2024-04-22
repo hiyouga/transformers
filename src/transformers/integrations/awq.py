@@ -15,7 +15,12 @@
 from ..activations import ACT2FN
 from ..modeling_utils import PreTrainedModel
 from ..utils import is_auto_awq_available, is_torch_available
-from ..utils.quantization_config import AwqBackendPackingMethod, AwqConfig, AWQLinearVersion
+from ..utils.quantization_config import (
+    AwqBackendPackingMethod,
+    AwqConfig,
+    AWQLinearVersion,
+    ExllamaVersion,
+)
 
 
 if is_torch_available():
@@ -30,7 +35,20 @@ AWQ_FUSED_MAPPINGS = {
         "layernorm": ["input_layernorm", "post_attention_layernorm", "norm"],
         "use_alibi": False,
     },
+    "mixtral": {
+        "attention": ["q_proj", "k_proj", "v_proj", "o_proj"],
+        "mlp": ["w1", "w3", "w2"],
+        "layernorm": ["input_layernorm", "post_attention_layernorm", "norm"],
+        "use_alibi": False,
+        "rope_theta": 1000000.0,
+    },
     "llama": {
+        "attention": ["q_proj", "k_proj", "v_proj", "o_proj"],
+        "mlp": ["gate_proj", "up_proj", "down_proj"],
+        "layernorm": ["input_layernorm", "post_attention_layernorm", "norm"],
+        "use_alibi": False,
+    },
+    "llava": {
         "attention": ["q_proj", "k_proj", "v_proj", "o_proj"],
         "mlp": ["gate_proj", "up_proj", "down_proj"],
         "layernorm": ["input_layernorm", "post_attention_layernorm", "norm"],
@@ -78,13 +96,30 @@ def replace_with_awq_linear(
         )
 
     if backend == AwqBackendPackingMethod.AUTOAWQ:
-        from awq.modules.linear import WQLinear_GEMM, WQLinear_GEMV
-    elif backend == AwqBackendPackingMethod.LLMAWQ:
+        if quantization_config.version == AWQLinearVersion.GEMM:
+            from awq.modules.linear.gemm import WQLinear_GEMM
+
+            target_cls = WQLinear_GEMM
+        elif quantization_config.version == AWQLinearVersion.GEMV:
+            from awq.modules.linear.gemv import WQLinear_GEMV
+
+            target_cls = WQLinear_GEMV
+        elif quantization_config.version == AWQLinearVersion.EXLLAMA:
+            if quantization_config.exllama_config["version"] == ExllamaVersion.ONE:
+                from awq.modules.linear.exllama import WQLinear_Exllama
+
+                target_cls = WQLinear_Exllama
+            elif quantization_config.exllama_config["version"] == ExllamaVersion.TWO:
+                from awq.modules.linear.exllamav2 import WQLinear_ExllamaV2
+
+                target_cls = WQLinear_ExllamaV2
+            else:
+                raise ValueError(f"Unrecognized Exllama version: {quantization_config.exllama_config['version']}")
+        else:
+            raise ValueError(f"Unrecognized AWQ version: {quantization_config.version}")
+    else:
         from awq.quantize.qmodule import WQLinear
 
-    if backend == AwqBackendPackingMethod.AUTOAWQ:
-        target_cls = WQLinear_GEMM if quantization_config.version == AWQLinearVersion.GEMM else WQLinear_GEMV
-    else:
         target_cls = WQLinear
 
     for name, module in model.named_children():
@@ -143,10 +178,16 @@ def get_modules_to_fuse(model, quantization_config):
     elif model.config.model_type in AWQ_FUSED_MAPPINGS:
         current_fused_mapping = AWQ_FUSED_MAPPINGS[model.config.model_type]
 
+        # Properly deal with the case where we have a multi-modal model as well (e.g. Llava)
+        if not hasattr(model.config, "text_config"):
+            config = model.config
+        else:
+            config = model.config.text_config
+
         # Handle hidden_size, num_attention_heads, num_key_value_heads on our own.
-        hidden_size = model.config.hidden_size
-        num_attention_heads = model.config.num_attention_heads
-        num_key_value_heads = getattr(model.config, "num_key_value_heads", num_attention_heads)
+        hidden_size = config.hidden_size
+        num_attention_heads = config.num_attention_heads
+        num_key_value_heads = getattr(config, "num_key_value_heads", num_attention_heads)
 
         # Fill `current_fused_mapping` with the expected values
         current_fused_mapping["hidden_size"] = hidden_size
@@ -168,16 +209,18 @@ def fuse_awq_modules(model, quantization_config):
     Args:
         model (`~PreTrainedModel`):
             The model to fuse - note this model should have been converted into AWQ format beforehand.
-        quantization_config (`dict`):
+        quantization_config (`Union[AwqConfig, dict]`):
             The quantization configuration to use.
     """
     # We need to convert it from dict in order to get an AwqConfig object
     # otherwise the fields `backend` etc. will not be available
     # https://github.com/huggingface/transformers/pull/27411#discussion_r1414044495
-    awq_config = AwqConfig.from_dict(quantization_config)
-    backend = awq_config.backend
+    if isinstance(quantization_config, dict):
+        quantization_config = AwqConfig.from_dict(quantization_config)
+    backend = quantization_config.backend
 
-    modules_to_fuse = get_modules_to_fuse(model, awq_config)
+    modules_to_fuse = get_modules_to_fuse(model, quantization_config)
+    modules_to_not_convert = getattr(quantization_config, "modules_to_not_convert", None)
 
     if backend == AwqBackendPackingMethod.AUTOAWQ:
         from awq.modules.fused.attn import QuantAttentionFused
@@ -186,7 +229,13 @@ def fuse_awq_modules(model, quantization_config):
     else:
         raise ValueError("Fusing is only supported for the AutoAWQ backend")
 
+    fused_attention_modules = []
+
     for name, module in model.named_modules():
+        if modules_to_not_convert is not None:
+            if any(module_name_to_not_convert in name for module_name_to_not_convert in modules_to_not_convert):
+                continue
+
         # Replace layer norms
         _fuse_awq_layernorm(modules_to_fuse["layernorm"], module, FasterTransformerRMSNorm)
 
@@ -194,7 +243,23 @@ def fuse_awq_modules(model, quantization_config):
         _fuse_awq_mlp(model, name, modules_to_fuse["mlp"], module, QuantFusedMLP)
 
         # Replace attention layers
-        _fuse_awq_attention_layers(model, module, modules_to_fuse, name, QuantAttentionFused)
+        attention_has_been_fused = _fuse_awq_attention_layers(
+            model, module, modules_to_fuse, name, QuantAttentionFused
+        )
+
+        if attention_has_been_fused:
+            fused_attention_modules.append(name.split(".")[0])
+
+    # For AWQ fused + Llama we need to set `config._attn_implementation` = "custom" to avoid unexpected behavior and pass
+    # `None` attention mask to the fused attention modules as now the attention mask is dropped by our models and dealt
+    # by the `AttentionMaskConverter` module.
+    if len(fused_attention_modules) > 0:
+        for module_name, module in model.named_modules():
+            if any(
+                module_name in fused_attention_modules for fused_attention_parent_module in fused_attention_modules
+            ):
+                if hasattr(module, "config") and hasattr(module.config, "_attn_implementation"):
+                    module.config._attn_implementation = "custom"
     return model
 
 
@@ -248,7 +313,14 @@ def _fuse_awq_mlp(model, current_module_name, fuse_module_names, module, target_
         down_proj = getattr(module, fuse_module_names[2])
 
         previous_device = gate_proj.qweight.device
-        activation_fn = ACT2FN[model.config.hidden_act]
+
+        # Deal also with the case model has `text_config` attribute
+        hidden_act = (
+            model.config.hidden_act
+            if not hasattr(model.config, "text_config")
+            else model.config.text_config.hidden_act
+        )
+        activation_fn = ACT2FN[hidden_act]
         new_module = target_cls(gate_proj, down_proj, up_proj, activation_fn)
 
         parent_name, child_name = current_module_name.rsplit(".", 1)
@@ -278,13 +350,14 @@ def _fuse_awq_attention_layers(model, module, modules_to_fuse, current_module_na
     """
     from awq.modules.linear import WQLinear_GEMM, WQLinear_GEMV
 
+    module_has_been_fused = False
+
     if len(modules_to_fuse["attention"]) == 0:
-        return
+        return module_has_been_fused
 
     if hasattr(module, modules_to_fuse["attention"][0]):
         # First, we pack the QKV layers together
         q_proj = getattr(module, modules_to_fuse["attention"][0])
-        previous_device = q_proj.qweight.device
 
         if isinstance(q_proj, WQLinear_GEMV):
             linear_target_cls = WQLinear_GEMV
@@ -294,6 +367,8 @@ def _fuse_awq_attention_layers(model, module, modules_to_fuse, current_module_na
             cat_dim = 1
         else:
             raise ValueError("Unsupported q_proj type: {type(q_proj)}")
+
+        previous_device = q_proj.qweight.device
 
         k_proj = getattr(module, modules_to_fuse["attention"][1])
         v_proj = getattr(module, modules_to_fuse["attention"][2])
@@ -328,6 +403,8 @@ def _fuse_awq_attention_layers(model, module, modules_to_fuse, current_module_na
             previous_device,
             modules_to_fuse["max_seq_len"],
             use_alibi=modules_to_fuse["use_alibi"],
+            # The default value in autoawq is set to 10000.0
+            rope_theta=modules_to_fuse.get("rope_theta", 10000.0),
         )
 
         fused_attention_layer.is_hf_transformers = True
@@ -337,3 +414,31 @@ def _fuse_awq_attention_layers(model, module, modules_to_fuse, current_module_na
         setattr(parent, child_name, fused_attention_layer.to(previous_device))
 
         del q_proj, k_proj, v_proj, o_proj
+        module_has_been_fused = True
+
+    return module_has_been_fused
+
+
+def post_init_awq_exllama_modules(model, exllama_config):
+    """
+    Runs post init for Exllama layers which performs:
+        - Weights unpacking, reordering and repacking
+        - Devices scratch space allocation
+    """
+
+    if exllama_config["version"] == ExllamaVersion.ONE:
+        from awq.modules.linear.exllama import exllama_post_init
+
+        model = exllama_post_init(model)
+    elif exllama_config["version"] == ExllamaVersion.TWO:
+        from awq.modules.linear.exllamav2 import exllamav2_post_init
+
+        model = exllamav2_post_init(
+            model,
+            max_input_len=exllama_config["max_input_len"],
+            max_batch_size=exllama_config["max_batch_size"],
+        )
+    else:
+        raise ValueError(f"Unrecognized Exllama version: {exllama_config['version']}")
+
+    return model

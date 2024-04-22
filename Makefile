@@ -5,12 +5,14 @@ export PYTHONPATH = src
 
 check_dirs := examples tests src utils
 
+exclude_folders := examples/research_projects
+
 modified_only_fixup:
 	$(eval modified_py_files := $(shell python utils/get_modified_files.py $(check_dirs)))
 	@if test -n "$(modified_py_files)"; then \
 		echo "Checking/fixing $(modified_py_files)"; \
-		ruff check $(modified_py_files) --fix; \
-		ruff format $(modified_py_files);\
+		ruff check $(modified_py_files) --fix --exclude $(exclude_folders); \
+		ruff format $(modified_py_files) --exclude $(exclude_folders);\
 	else \
 		echo "No library .py files were modified"; \
 	fi
@@ -44,15 +46,18 @@ repo-consistency:
 	python utils/update_metadata.py --check-only
 	python utils/check_task_guides.py
 	python utils/check_docstrings.py
+	python utils/check_support_list.py
 
 # this target runs checks on all files
 
 quality:
+	@python -c "from transformers import *" || (echo '🚨 import failed, this means you introduced unprotected imports! 🚨'; exit 1)
 	ruff check $(check_dirs) setup.py conftest.py
 	ruff format --check $(check_dirs) setup.py conftest.py
 	python utils/custom_init_isort.py --check_only
 	python utils/sort_auto_mappings.py --check_only
 	python utils/check_doc_toc.py
+
 
 # Format source code automatically and check is there are any problems left that need manual fixing
 
@@ -64,8 +69,8 @@ extra_style_checks:
 # this target runs checks on all files and potentially modifies some of them
 
 style:
-	ruff check $(check_dirs) setup.py conftest.py --fix
-	ruff format $(check_dirs) setup.py conftest.py
+	ruff check $(check_dirs) setup.py conftest.py --fix --exclude $(exclude_folders)
+	ruff format $(check_dirs) setup.py conftest.py --exclude $(exclude_folders)
 	${MAKE} autogenerate_code
 	${MAKE} extra_style_checks
 

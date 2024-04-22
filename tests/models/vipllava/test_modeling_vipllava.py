@@ -14,6 +14,7 @@
 # limitations under the License.
 """ Testing suite for the PyTorch VipLlava model. """
 
+import copy
 import gc
 import unittest
 
@@ -26,7 +27,7 @@ from transformers import (
     is_torch_available,
     is_vision_available,
 )
-from transformers.testing_utils import require_bitsandbytes, require_torch, slow, torch_device
+from transformers.testing_utils import require_bitsandbytes, require_torch, require_torch_gpu, slow, torch_device
 
 from ...test_configuration_common import ConfigTester
 from ...test_modeling_common import ModelTesterMixin, floats_tensor, ids_tensor
@@ -185,6 +186,171 @@ class VipLlavaForConditionalGenerationModelTest(ModelTesterMixin, unittest.TestC
     def test_training_gradient_checkpointing_use_reentrant_false(self):
         pass
 
+    # Copied from tests.test_modeling_common.ModelTesterMixin.test_resize_tokens_embeddings with config.vocab_size->config.text_config.vocab_size
+    def test_resize_tokens_embeddings(self):
+        (
+            original_config,
+            inputs_dict,
+        ) = self.model_tester.prepare_config_and_inputs_for_common()
+        if not self.test_resize_embeddings:
+            return
+
+        for model_class in self.all_model_classes:
+            config = copy.deepcopy(original_config)
+            model = model_class(config)
+            model.to(torch_device)
+
+            if self.model_tester.is_training is False:
+                model.eval()
+
+            model_vocab_size = config.text_config.vocab_size
+            # Retrieve the embeddings and clone theme
+            model_embed = model.resize_token_embeddings(model_vocab_size)
+            cloned_embeddings = model_embed.weight.clone()
+
+            # Check that resizing the token embeddings with a larger vocab size increases the model's vocab size
+            model_embed = model.resize_token_embeddings(model_vocab_size + 10)
+            self.assertEqual(model.config.text_config.vocab_size, model_vocab_size + 10)
+            # Check that it actually resizes the embeddings matrix
+            self.assertEqual(model_embed.weight.shape[0], cloned_embeddings.shape[0] + 10)
+            # Check that the model can still do a forward pass successfully (every parameter should be resized)
+            model(**self._prepare_for_class(inputs_dict, model_class))
+
+            # Check that resizing the token embeddings with a smaller vocab size decreases the model's vocab size
+            model_embed = model.resize_token_embeddings(model_vocab_size - 15)
+            self.assertEqual(model.config.text_config.vocab_size, model_vocab_size - 15)
+            # Check that it actually resizes the embeddings matrix
+            self.assertEqual(model_embed.weight.shape[0], cloned_embeddings.shape[0] - 15)
+
+            # Check that the model can still do a forward pass successfully (every parameter should be resized)
+            # Input ids should be clamped to the maximum size of the vocabulary
+            inputs_dict["input_ids"].clamp_(max=model_vocab_size - 15 - 1)
+
+            # make sure that decoder_input_ids are resized as well
+            if "decoder_input_ids" in inputs_dict:
+                inputs_dict["decoder_input_ids"].clamp_(max=model_vocab_size - 15 - 1)
+            model(**self._prepare_for_class(inputs_dict, model_class))
+
+            # Check that adding and removing tokens has not modified the first part of the embedding matrix.
+            models_equal = True
+            for p1, p2 in zip(cloned_embeddings, model_embed.weight):
+                if p1.data.ne(p2.data).sum() > 0:
+                    models_equal = False
+
+            self.assertTrue(models_equal)
+
+            config = copy.deepcopy(original_config)
+            model = model_class(config)
+            model.to(torch_device)
+
+            model_vocab_size = config.text_config.vocab_size
+            model.resize_token_embeddings(model_vocab_size + 10, pad_to_multiple_of=1)
+            self.assertTrue(model.config.text_config.vocab_size + 10, model_vocab_size)
+
+            model_embed = model.resize_token_embeddings(model_vocab_size, pad_to_multiple_of=64)
+            self.assertTrue(model_embed.weight.shape[0] // 64, 0)
+
+            self.assertTrue(model_embed.weight.shape[0], model.config.text_config.vocab_size)
+            self.assertTrue(model.config.text_config.vocab_size, model.vocab_size)
+
+            model_embed = model.resize_token_embeddings(model_vocab_size + 13, pad_to_multiple_of=64)
+            self.assertTrue(model_embed.weight.shape[0] // 64, 0)
+
+            # Check that resizing a model to a multiple of pad_to_multiple leads to a model of exactly that size
+            target_dimension = 128
+            model_embed = model.resize_token_embeddings(target_dimension, pad_to_multiple_of=64)
+            self.assertTrue(model_embed.weight.shape[0], target_dimension)
+
+            with self.assertRaisesRegex(
+                ValueError,
+                "Asking to pad the embedding matrix to a multiple of `1.3`, which is not and integer. Please make sure to pass an integer",
+            ):
+                model.resize_token_embeddings(model_vocab_size, pad_to_multiple_of=1.3)
+
+    # Copied from tests.test_modeling_common.ModelTesterMixin.test_resize_embeddings_untied with config.vocab_size->config.text_config.vocab_size
+    def test_resize_embeddings_untied(self):
+        (
+            original_config,
+            inputs_dict,
+        ) = self.model_tester.prepare_config_and_inputs_for_common()
+        if not self.test_resize_embeddings:
+            return
+
+        original_config.tie_word_embeddings = False
+
+        # if model cannot untied embeddings -> leave test
+        if original_config.tie_word_embeddings:
+            return
+
+        for model_class in self.all_model_classes:
+            config = copy.deepcopy(original_config)
+            model = model_class(config).to(torch_device)
+
+            # if no output embeddings -> leave test
+            if model.get_output_embeddings() is None:
+                continue
+
+            # Check that resizing the token embeddings with a larger vocab size increases the model's vocab size
+            model_vocab_size = config.text_config.vocab_size
+            model.resize_token_embeddings(model_vocab_size + 10)
+            self.assertEqual(model.config.text_config.vocab_size, model_vocab_size + 10)
+            output_embeds = model.get_output_embeddings()
+            self.assertEqual(output_embeds.weight.shape[0], model_vocab_size + 10)
+            # Check bias if present
+            if output_embeds.bias is not None:
+                self.assertEqual(output_embeds.bias.shape[0], model_vocab_size + 10)
+            # Check that the model can still do a forward pass successfully (every parameter should be resized)
+            model(**self._prepare_for_class(inputs_dict, model_class))
+
+            # Check that resizing the token embeddings with a smaller vocab size decreases the model's vocab size
+            model.resize_token_embeddings(model_vocab_size - 15)
+            self.assertEqual(model.config.text_config.vocab_size, model_vocab_size - 15)
+            # Check that it actually resizes the embeddings matrix
+            output_embeds = model.get_output_embeddings()
+            self.assertEqual(output_embeds.weight.shape[0], model_vocab_size - 15)
+            # Check bias if present
+            if output_embeds.bias is not None:
+                self.assertEqual(output_embeds.bias.shape[0], model_vocab_size - 15)
+            # Check that the model can still do a forward pass successfully (every parameter should be resized)
+            # Input ids should be clamped to the maximum size of the vocabulary
+            inputs_dict["input_ids"].clamp_(max=model_vocab_size - 15 - 1)
+            if "decoder_input_ids" in inputs_dict:
+                inputs_dict["decoder_input_ids"].clamp_(max=model_vocab_size - 15 - 1)
+            # Check that the model can still do a forward pass successfully (every parameter should be resized)
+            model(**self._prepare_for_class(inputs_dict, model_class))
+
+    # Copied from tests.test_modeling_common.ModelTesterMixin.test_tie_model_weights with config.vocab_size->config.text_config.vocab_size
+    def test_tie_model_weights(self):
+        if not self.test_torchscript:
+            return
+
+        config, inputs_dict = self.model_tester.prepare_config_and_inputs_for_common()
+
+        def check_same_values(layer_1, layer_2):
+            equal = True
+            for p1, p2 in zip(layer_1.weight, layer_2.weight):
+                if p1.data.ne(p2.data).sum() > 0:
+                    equal = False
+            return equal
+
+        for model_class in self.all_model_classes:
+            config.torchscript = True
+            model_not_tied = model_class(config)
+            if model_not_tied.get_output_embeddings() is None:
+                continue
+
+            config_tied = copy.deepcopy(config)
+            config_tied.torchscript = False
+            model_tied = model_class(config_tied)
+            params_tied = list(model_tied.parameters())
+            # Check that the embedding layer and decoding layer are the same in size and in value
+            # self.assertTrue(check_same_values(embeddings, decoding))
+
+            # Check that after resize they remain tied.
+            model_tied.resize_token_embeddings(config.text_config.vocab_size + 10)
+            params_tied_2 = list(model_tied.parameters())
+            self.assertEqual(len(params_tied_2), len(params_tied))
+
 
 @require_torch
 class VipLlavaForConditionalGenerationIntegrationTest(unittest.TestCase):
@@ -214,3 +380,41 @@ class VipLlavaForConditionalGenerationIntegrationTest(unittest.TestCase):
 
         EXPECTED_OUTPUT = "USER: <image> \nCan you please describe this image?\nASSISTANT: The image features a brown and white cat sitting on"
         self.assertEqual(processor.decode(outputs[0], skip_special_tokens=True), EXPECTED_OUTPUT)
+
+    @slow
+    @require_torch_gpu
+    def test_vipllava_merge_inputs_error_bug(self):
+        # This is a reproducer of https://github.com/huggingface/transformers/pull/28333 and makes sure it does not happen anymore
+        model_id = "llava-hf/vip-llava-7b-hf"
+        model = VipLlavaForConditionalGeneration.from_pretrained(
+            model_id, torch_dtype=torch.float16, low_cpu_mem_usage=True
+        ).to(torch_device)
+
+        # Simulate some user inputs
+        pixel_values = torch.randn(
+            (2, 3, 336, 336),
+            dtype=torch.float,
+            device=torch_device,
+        )
+        input_ids = torch.tensor(
+            [
+                [32001, 32001, 1, 15043, 7084, 32000, 29871, 13, 7900],
+                [1, 15043, 7084, 29901, 29871, 32000, 29871, 13, 7900],
+            ],
+            dtype=torch.long,
+            device=torch_device,
+        )
+        attention_mask = torch.tensor(
+            [[0, 0, 1, 1, 1, 1, 1, 1, 1], [1, 1, 1, 1, 1, 1, 1, 1, 1]],
+            dtype=torch.long,
+            device=torch_device,
+        )
+
+        # Make sure that the loss is properly computed
+        loss = model(
+            pixel_values=pixel_values,
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            labels=input_ids,
+        ).loss
+        loss.backward()

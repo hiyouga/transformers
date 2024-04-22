@@ -54,18 +54,8 @@ _CHECKPOINT_FOR_DOC = "google/switch-base-8"
 # This dict contains ids and associated url
 # for the pretrained weights provided with the models
 ####################################################
-SWITCH_TRANSFORMERS_PRETRAINED_MODEL_ARCHIVE_LIST = [
-    "google/switch-base-8",
-    "google/switch-base-16",
-    "google/switch-base-32",
-    "google/switch-base-64",
-    "google/switch-base-128",
-    "google/switch-base-256",
-    "google/switch-large-128",
-    "google/switch-xxl-128",
-    "google/switch-c-2048",
-    # See all SwitchTransformers models at https://huggingface.co/models?filter=switch_transformers
-]
+
+from ..deprecated._archive_maps import SWITCH_TRANSFORMERS_PRETRAINED_MODEL_ARCHIVE_LIST  # noqa: F401, E402
 
 
 def router_z_loss_func(router_logits: torch.Tensor) -> float:
@@ -168,7 +158,7 @@ class SwitchTransformersTop1Router(nn.Module):
         self.input_dtype = hidden_states.dtype
         hidden_states = hidden_states.to(self.dtype)
 
-        if self.jitter_noise > 0:
+        if self.training and self.jitter_noise > 0:
             # Multiply the token inputs by the uniform distribution - adding some noise
             hidden_states *= torch.empty_like(hidden_states).uniform_(1.0 - self.jitter_noise, 1.0 + self.jitter_noise)
 
@@ -898,7 +888,7 @@ class SwitchTransformersStack(SwitchTransformersPreTrainedModel):
         config.num_layers = config.num_decoder_layers if self.is_decoder else config.num_layers
         self.block = nn.ModuleList()
         for i in range(config.num_layers):
-            is_sparse = (i % sparse_step == 1) if sparse_step > 0 else False
+            is_sparse = (i % sparse_step == 1 or sparse_step == 1) if sparse_step > 0 else False
 
             self.block.append(
                 SwitchTransformersBlock(config, has_relative_attention_bias=bool(i == 0), is_sparse=is_sparse)
