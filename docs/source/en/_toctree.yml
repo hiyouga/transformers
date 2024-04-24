@@ -141,6 +141,8 @@
 - sections:
   - local: performance
     title: Overview
+  - local: llm_optims
+    title: LLM inference optimization
   - local: quantization
     title: Quantization
   - sections:
@@ -185,8 +187,6 @@
     title: How to contribute to 🤗 Transformers?
   - local: add_new_model
     title: How to add a model to 🤗 Transformers?
-  - local: add_tensorflow_model
-    title: How to convert a 🤗 Transformers model to TensorFlow?
   - local: add_new_pipeline
     title: How to add a pipeline to 🤗 Transformers?
   - local: testing
@@ -394,6 +394,8 @@
         title: LLaMA
       - local: model_doc/llama2
         title: Llama2
+      - local: model_doc/llama3
+        title: Llama3
       - local: model_doc/longformer
         title: Longformer
       - local: model_doc/longt5
